@@ -1,0 +1,425 @@
+# DAV Folder Cleaner — Bulletproof, Auditable, User-Safe
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$PrimaryColor = [System.Drawing.ColorTranslator]::FromHtml("#5b5c5a")
+$AccentColor  = [System.Drawing.ColorTranslator]::FromHtml("#bed12b")
+$FontFamily   = "Arial"
+$AppName      = "DAV Folder Cleaner"
+$AppDataPath  = "$env:LOCALAPPDATA\DAV_FolderCleaner"
+$ConfigPath   = "$AppDataPath\settings.json"
+$TaskName     = "DAVFolderCleanerDaily"
+$LogPath      = "$AppDataPath\cleanup.log"
+$DefaultExcludes = @(".lnk")
+
+# ---- Admin Elevation ----
+function Ensure-RunAsAdmin {
+    $wid = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $prp = New-Object System.Security.Principal.WindowsPrincipal($wid)
+    if(-not $prp.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)){
+        Start-Process pwsh.exe "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`"" -Verb RunAs
+        exit
+    }
+}
+Ensure-RunAsAdmin
+
+# ---- Config Self-Healing ----
+if (!(Test-Path $AppDataPath)) { New-Item -ItemType Directory -Path $AppDataPath -Force | Out-Null }
+if (!(Test-Path $ConfigPath)) {
+    $defaultConfig = @{
+        Folders = @()
+        Time    = "02:00 AM"
+        RestartTime = ""
+        Exclude = $DefaultExcludes
+    }
+    $defaultConfig | ConvertTo-Json | Set-Content $ConfigPath
+}
+function Load-Config { 
+    try {
+        $cfg = Get-Content $ConfigPath | ConvertFrom-Json
+        if ($null -eq $cfg.Folders) { $cfg | Add-Member -MemberType NoteProperty -Name Folders -Value @() }
+        if ($null -eq $cfg.Time)    { $cfg | Add-Member -MemberType NoteProperty -Name Time -Value "02:00 AM" }
+        if ($null -eq $cfg.RestartTime) { $cfg | Add-Member -MemberType NoteProperty -Name RestartTime -Value "" }
+        if ($null -eq $cfg.Exclude) { $cfg | Add-Member -MemberType NoteProperty -Name Exclude -Value $DefaultExcludes }
+        return $cfg
+    } catch {
+        Write-Log "ERROR loading config: $_"
+        # Rebuild config if corrupted
+        $defaultConfig = @{
+            Folders = @()
+            Time    = "02:00 AM"
+            RestartTime = ""
+            Exclude = $DefaultExcludes
+        }
+        $defaultConfig | ConvertTo-Json | Set-Content $ConfigPath
+        return $defaultConfig
+    }
+}
+function Save-Config($cfg) { $cfg | ConvertTo-Json | Set-Content $ConfigPath }
+
+# ---- Logging ----
+function Write-Log {
+    param([string]$msg)
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $msg"
+    Add-Content -Path $LogPath -Value $line
+}
+function Show-Log {
+    if (Test-Path $LogPath) {
+        $logText = Get-Content $LogPath -Raw
+        [System.Windows.Forms.MessageBox]::Show($logText, "$AppName - Cleanup Log")
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("No log file found.", "$AppName - Cleanup Log")
+    }
+}
+
+# ---- Safety: Never Clean System Paths ----
+$CriticalFolders = @(
+    "$env:WINDIR", "$env:ProgramFiles", "$env:ProgramFiles(x86)", "$env:SystemRoot",
+    "$env:LOCALAPPDATA", "$env:APPDATA", "$env:USERPROFILE\Windows"
+)
+function Is-SafeToClean ($path) {
+    foreach ($crit in $CriticalFolders) {
+        if ($path -like "$crit*" -or $path -eq $crit) { return $false }
+    }
+    return $true
+}
+# --- GUI Main Form ---
+function Show-MainForm {
+    $cfg = Load-Config
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $AppName
+    $form.Width = 700
+    $form.Height = 560
+    $form.StartPosition = "CenterScreen"
+    $form.BackColor = $PrimaryColor
+    $form.Font = New-Object System.Drawing.Font($FontFamily, 12)
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Folders List
+    $lblFolders = New-Object System.Windows.Forms.Label
+    $lblFolders.Text = "Folders to Clean:"
+    $lblFolders.ForeColor = $AccentColor
+    $lblFolders.Location = '30,28'
+    $lblFolders.AutoSize = $true
+    $form.Controls.Add($lblFolders)
+
+    $lstFolders = New-Object System.Windows.Forms.ListBox
+    $lstFolders.Location = '30,54'
+    $lstFolders.Size = '400,110'
+    $lstFolders.DataSource = $cfg.Folders
+    $form.Controls.Add($lstFolders)
+
+    $btnAddFolder = New-Object System.Windows.Forms.Button
+    $btnAddFolder.Text = "Add Folder"
+    $btnAddFolder.Location = '450,54'
+    $btnAddFolder.Size = '120,32'
+    $btnAddFolder.BackColor = $AccentColor
+    $btnAddFolder.Add_Click({
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        if ($fbd.ShowDialog() -eq "OK") {
+            if (!(($cfg.Folders) -contains $fbd.SelectedPath)) {
+                $cfg.Folders += $fbd.SelectedPath
+                $lstFolders.DataSource = $null
+                $lstFolders.DataSource = $cfg.Folders
+                Save-Config $cfg
+            }
+        }
+    })
+    $form.Controls.Add($btnAddFolder)
+
+    $btnRemoveFolder = New-Object System.Windows.Forms.Button
+    $btnRemoveFolder.Text = "Remove Folder"
+    $btnRemoveFolder.Location = '450,92'
+    $btnRemoveFolder.Size = '120,32'
+    $btnRemoveFolder.BackColor = $AccentColor
+    $btnRemoveFolder.Add_Click({
+        if ($lstFolders.SelectedIndex -ge 0) {
+            $cfg.Folders = $cfg.Folders | Where-Object { $_ -ne $lstFolders.SelectedItem }
+            $lstFolders.DataSource = $null
+            $lstFolders.DataSource = $cfg.Folders
+            Save-Config $cfg
+        }
+    })
+    $form.Controls.Add($btnRemoveFolder)
+
+    # Exclude Patterns
+    $lblExclude = New-Object System.Windows.Forms.Label
+    $lblExclude.Text = "Exclusions (filenames/wildcards, comma-separated):"
+    $lblExclude.ForeColor = $AccentColor
+    $lblExclude.Location = '30,180'
+    $lblExclude.AutoSize = $true
+    $form.Controls.Add($lblExclude)
+
+    $tbExclude = New-Object System.Windows.Forms.TextBox
+    $tbExclude.Location = '30,206'
+    $tbExclude.Size = '400,26'
+    $tbExclude.Text = [string]::Join(", ", $cfg.Exclude)
+    $form.Controls.Add($tbExclude)
+
+    $btnSaveExclude = New-Object System.Windows.Forms.Button
+    $btnSaveExclude.Text = "Save Exclusions"
+    $btnSaveExclude.Location = '450,206'
+    $btnSaveExclude.Size = '120,30'
+    $btnSaveExclude.BackColor = $AccentColor
+    $btnSaveExclude.Add_Click({
+        $cfg.Exclude = ($tbExclude.Text -split ",") | ForEach-Object { $_.Trim() }
+        Save-Config $cfg
+    })
+    $form.Controls.Add($btnSaveExclude)
+
+    # Cleanup Time
+    $lblTime = New-Object System.Windows.Forms.Label
+    $lblTime.Text = "Cleanup Time (24h or 12h):"
+    $lblTime.ForeColor = $AccentColor
+    $lblTime.Location = '30,254'
+    $lblTime.AutoSize = $true
+    $form.Controls.Add($lblTime)
+
+    $tbTime = New-Object System.Windows.Forms.TextBox
+    $tbTime.Location = '30,280'
+    $tbTime.Size = '120,26'
+    $tbTime.Text = $cfg.Time
+    $form.Controls.Add($tbTime)
+
+    $lblRestart = New-Object System.Windows.Forms.Label
+    $lblRestart.Text = "Restart PC at (optional):"
+    $lblRestart.ForeColor = $AccentColor
+    $lblRestart.Location = '190,254'
+    $lblRestart.AutoSize = $true
+    $form.Controls.Add($lblRestart)
+
+    $tbRestart = New-Object System.Windows.Forms.TextBox
+    $tbRestart.Location = '190,280'
+    $tbRestart.Size = '120,26'
+    $tbRestart.Text = $cfg.RestartTime
+    $form.Controls.Add($tbRestart)
+
+    # Save Config
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = "Save & Schedule"
+    $btnSave.Location = '350,280'
+    $btnSave.Size = '150,32'
+    $btnSave.BackColor = $AccentColor
+    $btnSave.Add_Click({
+        $cfg.Time = $tbTime.Text
+        $cfg.RestartTime = $tbRestart.Text
+        $cfg.Exclude = ($tbExclude.Text -split ",") | ForEach-Object { $_.Trim() }
+        Save-Config $cfg
+        Register-CleanupTask $cfg
+        [System.Windows.Forms.MessageBox]::Show("Settings saved and task scheduled!","$AppName")
+    })
+    $form.Controls.Add($btnSave)
+
+    # Preview/Manual Run
+    $btnPreview = New-Object System.Windows.Forms.Button
+    $btnPreview.Text = "Preview Cleanup"
+    $btnPreview.Location = '30,340'
+    $btnPreview.Size = '150,36'
+    $btnPreview.BackColor = $AccentColor
+    $btnPreview.Add_Click({
+        Preview-Cleanup $cfg
+    })
+    $form.Controls.Add($btnPreview)
+
+    $btnRunNow = New-Object System.Windows.Forms.Button
+    $btnRunNow.Text = "Run Cleanup Now"
+    $btnRunNow.Location = '190,340'
+    $btnRunNow.Size = '150,36'
+    $btnRunNow.BackColor = $AccentColor
+    $btnRunNow.Add_Click({
+        $ans = [System.Windows.Forms.MessageBox]::Show("Are you sure you want to permanently delete all non-excluded files from the selected folders right now?","$AppName",'YesNo')
+        if ($ans -eq "Yes") {
+            Run-Cleanup $cfg
+        }
+    })
+    $form.Controls.Add($btnRunNow)
+
+    # View Log
+    $btnViewLog = New-Object System.Windows.Forms.Button
+    $btnViewLog.Text = "View Cleanup Log"
+    $btnViewLog.Location = '350,340'
+    $btnViewLog.Size = '150,36'
+    $btnViewLog.BackColor = $AccentColor
+    $btnViewLog.Add_Click({
+        Show-Log
+    })
+    $form.Controls.Add($btnViewLog)
+
+    # Exit
+    $btnExit = New-Object System.Windows.Forms.Button
+    $btnExit.Text = "Exit"
+    $btnExit.Location = '30,410'
+    $btnExit.Size = '120,36'
+    $btnExit.BackColor = "DarkRed"
+    $btnExit.ForeColor = "White"
+    $btnExit.Add_Click({ $form.Close() })
+    $form.Controls.Add($btnExit)
+
+    # Show info
+    $lblInfo = New-Object System.Windows.Forms.Label
+    $lblInfo.Text = "For safety, Windows and Program Files folders are never cleaned."
+    $lblInfo.ForeColor = $AccentColor
+    $lblInfo.Location = '30,460'
+    $lblInfo.AutoSize = $true
+    $form.Controls.Add($lblInfo)
+
+    $form.Add_Shown({ $form.Activate() })
+    [void]$form.ShowDialog()
+}
+
+# ---- Scheduling via Task Scheduler ----
+function Register-CleanupTask($cfg) {
+    $time = $cfg.Time
+    $ps = $MyInvocation.MyCommand.Definition
+    $taskXML = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>$AppName daily cleanup</Description></RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2022-01-01T$($time):00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>pwsh.exe</Command>
+      <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$ps"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+    $xmlFile = "$env:TEMP\DAV_FolderCleanerTask.xml"
+    $taskExists = schtasks /Query /TN $TaskName 2>$null
+    if ($taskExists) {
+        schtasks /Delete /TN $TaskName /F | Out-Null
+    }
+    $taskXML | Out-File -Encoding unicode $xmlFile
+    schtasks /Create /TN $TaskName /XML $xmlFile /F | Out-Null
+    Remove-Item $xmlFile -ErrorAction SilentlyContinue
+    Write-Log "Scheduled task registered/updated for daily cleanup."
+}
+# --- File Exclusion Logic ---
+function Should-ExcludeFile($file, $excludePatterns) {
+    foreach ($pat in $excludePatterns) {
+        if ($null -eq $pat -or $pat -eq "") { continue }
+        # Wildcard support, match full name
+        if ($file.Name -like $pat) { return $true }
+        # Support excluding by partial match
+        if ($file.Name -like "*$pat*") { return $true }
+    }
+    return $false
+}
+
+# --- Preview Cleanup ---
+function Preview-Cleanup($cfg) {
+    $toDelete = @()
+    foreach ($folder in $cfg.Folders) {
+        if (-not (Test-Path $folder)) { continue }
+        if (-not (Is-SafeToClean $folder)) {
+            [System.Windows.Forms.MessageBox]::Show("Skipping unsafe system folder: $folder", $AppName)
+            continue
+        }
+        $files = Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue
+        foreach ($file in $files) {
+            if (-not (Should-ExcludeFile $file $cfg.Exclude)) {
+                $toDelete += $file.FullName
+            }
+        }
+    }
+    $msg = if ($toDelete.Count -eq 0) {
+        "No files would be deleted."
+    } else {
+        "Files that would be deleted:`n`n" + ($toDelete -join "`n")
+    }
+    [System.Windows.Forms.MessageBox]::Show($msg, "$AppName Preview")
+    Write-Log "Previewed cleanup: $($toDelete.Count) files would be deleted."
+}
+
+# --- Safe Delete (with Recycle Bin Fallback) ---
+function Safe-DeleteFile($path) {
+    try {
+        # Try Recycle Bin
+        $shell = New-Object -ComObject Shell.Application
+        $folder = Split-Path $path
+        $file = Split-Path $path -Leaf
+        $item = $shell.Namespace($folder).ParseName($file)
+        if ($item) {
+            $item.InvokeVerb("delete")
+            Write-Log "Deleted to Recycle Bin: $path"
+            return
+        }
+    } catch { }
+    try {
+        Remove-Item -Path $path -Force -ErrorAction Stop
+        Write-Log "Deleted (permanent): $path"
+    } catch {
+        Write-Log "FAILED to delete: $path -- $_"
+    }
+}
+
+# --- Run Cleanup ---
+function Run-Cleanup($cfg) {
+    $count = 0
+    foreach ($folder in $cfg.Folders) {
+        if (-not (Test-Path $folder)) { continue }
+        if (-not (Is-SafeToClean $folder)) {
+            Write-Log "Skipped unsafe folder: $folder"
+            continue
+        }
+        $files = Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue
+        foreach ($file in $files) {
+            if (-not (Should-ExcludeFile $file $cfg.Exclude)) {
+                Safe-DeleteFile $file.FullName
+                $count++
+            }
+        }
+    }
+    Write-Log "Cleanup complete: $count files deleted."
+    [System.Windows.Forms.MessageBox]::Show("$count files deleted.","$AppName")
+    # Auto-restart if configured
+    if ($cfg.RestartTime -and ((Get-Date).ToString("HH:mm") -eq (Get-Date $cfg.RestartTime).ToString("HH:mm"))) {
+        Write-Log "Restarting computer as scheduled."
+        Restart-Computer -Force
+    }
+}
+
+# --- Entry Point ---
+if ($Host.Name -notlike "*Windows PowerShell ISE*") {
+    # Only run GUI if NOT called as scheduled task
+    if ($MyInvocation.Line -notmatch "-File" -or $args.Count -eq 0) {
+        Show-MainForm
+    } else {
+        # If run by Task Scheduler, do the cleanup (no GUI)
+        $cfg = Load-Config
+        Run-Cleanup $cfg
+    }
+}
