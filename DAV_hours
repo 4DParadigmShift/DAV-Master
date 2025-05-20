@@ -1,0 +1,1197 @@
+$ConfigFolder = "$env:APPDATA\\DAV_Transport"
+$LocationFile = "$ConfigFolder\\location.txt"
+if (-not (Test-Path $ConfigFolder)) { New-Item -ItemType Directory -Path $ConfigFolder -Force | Out-Null }
+function Get-DataDir {
+    if (Test-Path $LocationFile) {
+        $path = Get-Content $LocationFile -Raw
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path)) { return $path }
+    }
+    # Default: local appdata if not set
+    return "$env:LOCALAPPDATA\\DAV_Transport"
+}
+function Set-DataDir($newPath) {
+    $newPath = $newPath.Trim()
+    if (-not (Test-Path $newPath)) { New-Item -ItemType Directory -Path $newPath -Force | Out-Null }
+    Set-Content $LocationFile $newPath
+}
+$AppDir = Get-DataDir
+$DriversFile = "$AppDir\\drivers.csv"
+$ClientsFile = "$AppDir\\clients.csv"
+$DestFile    = "$AppDir\\destinations.csv"
+$ApptFile    = "$AppDir\\appts.csv"
+$LogFile     = "$AppDir\\dispatch.log"
+
+# --- DAV Kiosk Time Tracker ---
+Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Windows.Forms
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+# --- ADMIN ELEVATION ---
+function Ensure-Admin {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = (Get-Process -Id $PID).Path
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+        $psi.Verb = "runas"
+        try { [System.Diagnostics.Process]::Start($psi) | Out-Null } catch { [System.Windows.MessageBox]::Show("Administrator privileges are required. Exiting.","Admin Required",'OK','Error') }
+        exit
+    }
+}
+Ensure-Admin
+
+# --- CONSTANTS & PATHS ---
+$PrimaryColor = "#5b5c5a"
+$AccentColor  = "#bed12b"
+$FontFamily   = "Arial"
+$MainFontSize = 28
+$ButtonFontSize = 28
+$InputFontSize = 24
+
+$AppName = "DAV Kiosk Time Tracker"
+$AppDir = "$env:LOCALAPPDATA\DAV_Kiosk"
+$UserFile = "$AppDir\users.json"
+$EntryFile = "$AppDir\entries.json"
+$PasswordFile = "$AppDir\password.txt"
+$ConfigFile = "$AppDir\config.json"
+$LogFile = "$AppDir\audit.log"
+$DefaultExport = "$env:USERPROFILE\Documents\DAV_TimeHistory.csv"
+$CsvTemplatePath = "$env:USERPROFILE\Desktop\DAV_TimeHistory_Template.csv"
+
+# --- LOGGING & CONFIG INITIALIZATION ---
+function Write-AuditLog {
+    param([string]$Event, [string]$User="", [string]$Details="")
+    $log = @{
+        Time = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        User = $User
+        Computer = $env:COMPUTERNAME
+        WindowsUser = $env:USERNAME
+        Event = $Event
+        Details = $Details
+    }
+    $entry = ($log | ConvertTo-Json -Compress)
+    Add-Content $LogFile $entry
+}
+
+function Ensure-Config {
+    if (-not (Test-Path $AppDir)) { New-Item -ItemType Directory -Path $AppDir | Out-Null }
+    if (-not (Test-Path $UserFile)) { @() | ConvertTo-Json | Set-Content $UserFile }
+    if (-not (Test-Path $EntryFile)) { @() | ConvertTo-Json | Set-Content $EntryFile }
+    if (-not (Test-Path $PasswordFile)) { Set-Content $PasswordFile "" }
+    if (-not (Test-Path $ConfigFile)) { @{ExportPath = $DefaultExport} | ConvertTo-Json | Set-Content $ConfigFile }
+    if (-not (Test-Path $LogFile)) { New-Item -Path $LogFile -ItemType File | Out-Null }
+}
+Ensure-Config
+
+function Get-Config { Ensure-Config; return Get-Content $ConfigFile | ConvertFrom-Json }
+function Get-Users { Ensure-Config; return @((Get-Content $UserFile | ConvertFrom-Json) 2>$null) }
+function Get-Entries { Ensure-Config; return @((Get-Content $EntryFile | ConvertFrom-Json) 2>$null) }
+function Set-Config($obj) { $obj | ConvertTo-Json | Set-Content $ConfigFile }
+function Set-Users($arr) { $arr | ConvertTo-Json | Set-Content $UserFile }
+function Set-Entries($arr) { $arr | ConvertTo-Json | Set-Content $EntryFile }
+function Set-Password($pwd) { $clean = $pwd -replace '\s', ''; Set-Content $PasswordFile $clean }
+function Get-Password { Ensure-Config; ((Get-Content $PasswordFile -Raw) -replace '\s','') }
+
+# --- UTILITY ---
+function Format-HoursMinutes {
+    param($hrs)
+    if ($null -eq $hrs -or $hrs -eq "") { return "" }
+    $n = [double]$hrs
+    if ($n -lt 1) {
+        return ("{0} min" -f ([int]($n * 60)))
+    } else {
+        return ("{0:N2} hrs" -f $n)
+    }
+}
+
+function Export-History($entries, $path) {
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        Show-StylizedMessage "Export location not set. Please set export location."
+        return
+    }
+    $csv = $entries | Select-Object UserName,UserID,ClockIn,ClockOut,HoursWorked,ClockedByUser,ClockedByComputer
+    $csv | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+}
+
+function Export-History-Template {
+    $cols = @("UserName","UserID","ClockIn","ClockOut","HoursWorked","ClockedByUser","ClockedByComputer")
+    $dummy = New-Object PSObject -Property @{
+        UserName = "John Doe"
+        UserID = "1234"
+        ClockIn = "2024-01-01 08:00:00"
+        ClockOut = "2024-01-01 12:00:00"
+        HoursWorked = "4.00"
+        ClockedByUser = "admin"
+        ClockedByComputer = "COMPUTER1"
+    }
+    $arr = @($dummy)
+    $arr | Export-Csv -Path $CsvTemplatePath -NoTypeInformation -Encoding UTF8
+    Show-StylizedMessage "Template saved to $CsvTemplatePath"
+}
+
+function Import-HoursFromCsv($path) {
+    try {
+        $csv = Import-Csv $path
+        $entries = @(Get-Entries)
+        foreach ($row in $csv) {
+            if ($row.UserID -and $row.ClockIn) {
+                if (-not ($entries | Where-Object { $_.UserID -eq $row.UserID -and $_.ClockIn -eq $row.ClockIn })) {
+                    $entries += $row
+                }
+            }
+        }
+        Set-Entries $entries
+        Show-StylizedMessage "Imported. Now showing latest history."
+    } catch {
+        Show-StylizedMessage "Import failed: $($_.Exception.Message)"
+    }
+}
+
+function Show-StylizedMessage {
+    param(
+        [string]$msg,
+        [string]$title = $AppName
+    )
+    $window = New-Object Windows.Window
+    $window.Title = $title
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $window.AllowsTransparency = $false
+    $window.ShowInTaskbar = $true
+
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,24,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = $msg
+    $lbl.FontSize = 24
+    $lbl.FontFamily = $FontFamily
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = '0,12,0,22'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $btn = New-Object Windows.Controls.Button
+    $btn.Content = "OK"
+    $btn.FontSize = 22
+    $btn.Width = 100
+    $btn.Height = 46
+    $btn.Margin = '0,0,0,0'
+    $btn.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btn.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btn.HorizontalAlignment = 'Center'
+    $btn.Add_Click({ $window.Close() })
+    $sp.Children.Add($btn) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+function Show-PasswordDialog {
+    param(
+        [string]$Title = "Enter Password",
+        [string]$Prompt = "Enter the management password:",
+        [string]$ButtonText = "Submit",
+        [bool]$IsCreation = $false
+    )
+    $window = New-Object Windows.Window
+    $window.Title = $Title
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $window.AllowsTransparency = $false
+    $window.ShowInTaskbar = $true
+
+    $grid = New-Object Windows.Controls.Grid
+    $grid.HorizontalAlignment = 'Center'
+    $grid.VerticalAlignment = 'Center'
+
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,24,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = $Prompt
+    $lbl.FontSize = $MainFontSize
+    $lbl.FontFamily = $FontFamily
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = '0,0,0,16'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $pwdBox = New-Object Windows.Controls.PasswordBox
+    $pwdBox.FontSize = $InputFontSize
+    $pwdBox.Width = 220
+    $pwdBox.Height = 42
+    $pwdBox.HorizontalAlignment = 'Center'
+    $pwdBox.Margin = '0,0,0,18'
+    $sp.Children.Add($pwdBox) | Out-Null
+
+    if ($IsCreation) {
+        $lblHint = New-Object Windows.Controls.Label
+        $lblHint.Content = "Minimum 4 characters. No spaces."
+        $lblHint.FontSize = 18
+        $lblHint.FontFamily = $FontFamily
+        $lblHint.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+        $lblHint.HorizontalAlignment = 'Center'
+        $lblHint.Margin = '0,0,0,10'
+        $sp.Children.Add($lblHint) | Out-Null
+    }
+
+    $btn = New-Object Windows.Controls.Button
+    $btn.Content = $ButtonText
+    $btn.FontSize = $ButtonFontSize
+    $btn.Width = 140
+    $btn.Height = 55
+    $btn.Margin = '0,0,0,0'
+    $btn.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btn.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btn.HorizontalAlignment = 'Center'
+
+    $btn.Add_Click({
+        $pw = $pwdBox.Password.Trim() -replace '\s',''
+        if ($IsCreation -and $pw.Length -lt 4) {
+            Show-StylizedMessage "Password must be at least 4 characters, no spaces."
+            return
+        }
+        $window.Tag = $pw
+        $window.Close()
+    })
+    $sp.Children.Add($btn) | Out-Null
+
+    $grid.Children.Add($sp) | Out-Null
+    $window.Content = $grid
+    $window.ShowDialog() | Out-Null
+    return $window.Tag
+}
+
+function Ensure-Password {
+    $pwd = Get-Password
+    if ([string]::IsNullOrWhiteSpace($pwd)) {
+        Show-StylizedMessage "Create a Manage menu password. You will need this to access Manage functions."
+        $newPwd = ""
+        while ($newPwd.Length -lt 4) {
+            $newPwd = Show-PasswordDialog -Title "Set Manage Password" -Prompt "Create Manage Menu Password:" -ButtonText "Set Password" -IsCreation $true
+            if ($null -eq $newPwd) { return }
+            $newPwd = $newPwd -replace '\s',''
+        }
+        Set-Password $newPwd
+    }
+}
+Ensure-Password
+
+function Show-PasswordPrompt {
+    $pwd = Show-PasswordDialog -Title "Enter Manage Password" -Prompt "Enter Manage Menu Password:" -ButtonText "Submit"
+    if ($null -eq $pwd) { return }
+    $pwd = $pwd -replace '\s',''
+    $realPwd = Get-Password
+    if ($pwd -eq $realPwd) {
+        Show-ManageMenu
+    } else {
+        Show-StylizedMessage "Incorrect password!"
+    }
+}
+
+function Show-AddUser {
+    # ... unchanged from above, see Part 3 if you need the code ...
+}
+
+function Show-DelUser {
+    # ... unchanged from above, see Part 3 if you need the code ...
+}
+
+function Show-SetExport {
+    $cfg = Get-Config
+    $window = New-Object Windows.Window
+    $window.Title = "Set Export Location"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,18,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = "Export Path (.csv will be written here after each clock-out):"
+    $lbl.FontSize = 18
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lbl.HorizontalAlignment = 'Left'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $tb = New-Object Windows.Controls.TextBox
+    $tb.Text = $cfg.ExportPath
+    $tb.FontSize = 18
+    $tb.Width = 390
+    $tb.Margin = '0,0,0,10'
+    $sp.Children.Add($tb) | Out-Null
+
+    $btnBrowse = New-Object Windows.Controls.Button
+    $btnBrowse.Content = "Browse"
+    $btnBrowse.FontSize = 16
+    $btnBrowse.Width = 90
+    $btnBrowse.Height = 34
+    $btnBrowse.Margin = '0,0,0,10'
+    $btnBrowse.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnBrowse.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnBrowse.Add_Click({
+        Add-Type -AssemblyName System.Windows.Forms
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        if (-not [string]::IsNullOrWhiteSpace($tb.Text) -and (Test-Path (Split-Path $tb.Text))) {
+            $fbd.SelectedPath = Split-Path $tb.Text
+        } else {
+            $fbd.SelectedPath = [Environment]::GetFolderPath("MyDocuments")
+        }
+        if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            if (-not [string]::IsNullOrWhiteSpace($tb.Text)) {
+                $leaf = Split-Path $tb.Text -Leaf
+            } else {
+                $leaf = "DAV_TimeHistory.csv"
+            }
+            $tb.Text = Join-Path $fbd.SelectedPath $leaf
+        }
+    })
+    $sp.Children.Add($btnBrowse) | Out-Null
+
+    $btnSave = New-Object Windows.Controls.Button
+    $btnSave.Content = "Save"
+    $btnSave.FontSize = 18
+    $btnSave.Width = 120
+    $btnSave.Height = 36
+    $btnSave.Margin = '0,0,0,0'
+    $btnSave.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnSave.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnSave.Add_Click({
+        $cfg.ExportPath = $tb.Text
+        Set-Config $cfg
+        $window.Close()
+        Show-ManageMenu
+    })
+    $sp.Children.Add($btnSave) | Out-Null
+
+    $btnBack = New-Object Windows.Controls.Button
+    $btnBack.Content = "Back"
+    $btnBack.FontSize = 16
+    $btnBack.Width = 100
+    $btnBack.Height = 32
+    $btnBack.Margin = '0,12,0,0'
+    $btnBack.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Gray))
+    $btnBack.Add_Click({ $window.Close(); Show-ManageMenu })
+    $sp.Children.Add($btnBack) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+function Show-AddUser {
+    $window = New-Object Windows.Window
+    $window.Title = "Add User"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,30,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = "Enter Name and 4-digit ID"
+    $lbl.FontSize = 22
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $lblName = New-Object Windows.Controls.Label
+    $lblName.Content = "Name:"
+    $lblName.FontSize = 18
+    $lblName.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblName.Margin = '0,6,0,0'
+    $sp.Children.Add($lblName) | Out-Null
+
+    $tbName = New-Object Windows.Controls.TextBox
+    $tbName.FontSize = 18
+    $tbName.Width = 220
+    $tbName.Margin = '0,0,0,8'
+    $sp.Children.Add($tbName) | Out-Null
+
+    $lblID = New-Object Windows.Controls.Label
+    $lblID.Content = "4-digit ID:"
+    $lblID.FontSize = 18
+    $lblID.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblID.Margin = '0,6,0,0'
+    $sp.Children.Add($lblID) | Out-Null
+
+    $tbID = New-Object Windows.Controls.TextBox
+    $tbID.FontSize = 18
+    $tbID.Width = 120
+    $tbID.Margin = '0,0,0,18'
+    $sp.Children.Add($tbID) | Out-Null
+
+    $btnAdd = New-Object Windows.Controls.Button
+    $btnAdd.Content = "Add"
+    $btnAdd.FontSize = 19
+    $btnAdd.Width = 120
+    $btnAdd.Height = 38
+    $btnAdd.Margin = '0,0,0,8'
+    $btnAdd.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnAdd.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnAdd.HorizontalAlignment = 'Center'
+    $btnAdd.Add_Click({
+        $name = $tbName.Text.Trim()
+        $id = $tbID.Text.Trim()
+        if (-not $name) { Show-StylizedMessage "Name required."; return }
+        if (-not ($id -match '^\d{4}$')) { Show-StylizedMessage "4-digit ID required."; return }
+        $users = @(Get-Users)
+        if ($users | Where-Object { $_.ID -eq $id }) { Show-StylizedMessage "ID already exists."; return }
+        $users += @{ Name = $name; ID = $id }
+        Set-Users $users
+        Write-AuditLog -Event "User Added" -User $name
+        Show-StylizedMessage "User $name added."
+        $window.Close()
+        Show-ManageMenu
+    })
+    $sp.Children.Add($btnAdd) | Out-Null
+
+    $btnBack = New-Object Windows.Controls.Button
+    $btnBack.Content = "Back"
+    $btnBack.FontSize = 16
+    $btnBack.Width = 100
+    $btnBack.Height = 34
+    $btnBack.Margin = '0,10,0,0'
+    $btnBack.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Gray))
+    $btnBack.Add_Click({ $window.Close(); Show-ManageMenu })
+    $sp.Children.Add($btnBack) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+
+function Show-DelUser {
+    $users = @(Get-Users)
+    $window = New-Object Windows.Window
+    $window.Title = "Delete User"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,30,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = "Select user to remove"
+    $lbl.FontSize = 22
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $lst = New-Object Windows.Controls.ListBox
+    $lst.FontSize = 18
+    $lst.Width = 280
+    $lst.Height = 190
+    foreach ($u in $users) {
+        $item = New-Object Windows.Controls.ListBoxItem
+        $item.Content = "$($u.Name) ($($u.ID))"
+        $item.Tag = $u
+        $lst.Items.Add($item) | Out-Null
+    }
+    $sp.Children.Add($lst) | Out-Null
+
+    $btnDel = New-Object Windows.Controls.Button
+    $btnDel.Content = "Delete"
+    $btnDel.FontSize = 19
+    $btnDel.Width = 120
+    $btnDel.Height = 38
+    $btnDel.Margin = '0,8,0,0'
+    $btnDel.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnDel.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnDel.HorizontalAlignment = 'Center'
+    $btnDel.Add_Click({
+        $item = $lst.SelectedItem
+        if ($null -eq $item -or $null -eq $item.Tag) { Show-StylizedMessage "Select a user to delete."; return }
+        $users = @(Get-Users) | Where-Object { $_.ID -ne $item.Tag.ID }
+        Set-Users $users
+        Write-AuditLog -Event "User Deleted" -User $item.Tag.Name
+        Show-StylizedMessage "User $($item.Tag.Name) deleted."
+        $window.Close()
+        Show-ManageMenu
+    })
+    $sp.Children.Add($btnDel) | Out-Null
+
+    $btnBack = New-Object Windows.Controls.Button
+    $btnBack.Content = "Back"
+    $btnBack.FontSize = 16
+    $btnBack.Width = 100
+    $btnBack.Height = 34
+    $btnBack.Margin = '0,10,0,0'
+    $btnBack.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Gray))
+    $btnBack.Add_Click({ $window.Close(); Show-ManageMenu })
+    $sp.Children.Add($btnBack) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+function Show-EditEntryDialog {
+    param($entry, [scriptblock]$onSave)
+    $window = New-Object Windows.Window
+    $window.Title = "Edit Entry"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,22,0,0'
+
+    foreach ($pair in @(
+        @{Label="Name:"; Field="UserName"; Width=280},
+        @{Label="ID:"; Field="UserID"; Width=120},
+        @{Label="Clock In:"; Field="ClockIn"; Width=220},
+        @{Label="Clock Out:"; Field="ClockOut"; Width=220},
+        @{Label="Hours:"; Field="HoursWorked"; Width=110}
+    )) {
+        $lbl = New-Object Windows.Controls.Label
+        $lbl.Content = $pair.Label
+        $lbl.FontSize = 20
+        $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+        $lbl.HorizontalAlignment = 'Center'
+        $lbl.Margin = '0,0,0,0'
+        $sp.Children.Add($lbl) | Out-Null
+
+        $tb = New-Object Windows.Controls.TextBox
+        $tb.FontSize = 18
+        $tb.Width = $pair.Width
+        $tb.Margin = '0,0,0,6'
+        $tb.Text = $entry[$pair.Field]
+        $tb.Tag = $pair.Field
+        $sp.Children.Add($tb) | Out-Null
+    }
+
+    $btnSave = New-Object Windows.Controls.Button
+    $btnSave.Content = "Save Changes"
+    $btnSave.FontSize = 20
+    $btnSave.Width = 200
+    $btnSave.Height = 46
+    $btnSave.Margin = '0,10,0,8'
+    $btnSave.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnSave.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnSave.HorizontalAlignment = 'Center'
+    $btnSave.Add_Click({
+        foreach ($c in $sp.Children) {
+            if ($c -is [Windows.Controls.TextBox]) {
+                $f = $c.Tag
+                $entry[$f] = $c.Text
+            }
+        }
+        $window.Close()
+        & $onSave
+    })
+    $sp.Children.Add($btnSave) | Out-Null
+
+    $btnCancel = New-Object Windows.Controls.Button
+    $btnCancel.Content = "Cancel"
+    $btnCancel.FontSize = 18
+    $btnCancel.Width = 120
+    $btnCancel.Height = 38
+    $btnCancel.Margin = '0,0,0,0'
+    $btnCancel.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Gray))
+    $btnCancel.HorizontalAlignment = 'Center'
+    $btnCancel.Add_Click({ $window.Close() })
+    $sp.Children.Add($btnCancel) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+
+function Show-History {
+    $entries = @(Get-Entries)
+    $users = @(Get-Users)
+    $cfg = Get-Config
+
+    $window = New-Object Windows.Window
+    $window.Title = "History"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $window.ShowInTaskbar = $true
+
+    $main = New-Object Windows.Controls.DockPanel
+    $main.Margin = '12,12,12,12'
+
+    $filterPanel = New-Object Windows.Controls.StackPanel
+    $filterPanel.Orientation = 'Horizontal'
+    $filterPanel.HorizontalAlignment = 'Left'
+    $filterPanel.Margin = '0,0,0,10'
+
+    $lblUser = New-Object Windows.Controls.Label
+    $lblUser.Content = "User:"
+    $lblUser.FontSize = 16
+    $lblUser.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblUser.Margin = '0,0,6,0'
+    $filterPanel.Children.Add($lblUser) | Out-Null
+
+    $cbUser = New-Object Windows.Controls.ComboBox
+    $cbUser.Width = 180
+    $cbUser.FontSize = 15
+    $cbUser.IsEditable = $true
+    $cbUser.Margin = '0,0,16,0'
+    $cbUser.Items.Add("") | Out-Null
+    foreach ($u in $users) { $cbUser.Items.Add($u.Name) | Out-Null }
+    $filterPanel.Children.Add($cbUser) | Out-Null
+
+    $lblFrom = New-Object Windows.Controls.Label
+    $lblFrom.Content = "From (yyyy-mm-dd):"
+    $lblFrom.FontSize = 16
+    $lblFrom.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblFrom.Margin = '0,0,6,0'
+    $filterPanel.Children.Add($lblFrom) | Out-Null
+
+    $tbFrom = New-Object Windows.Controls.TextBox
+    $tbFrom.Width = 100
+    $tbFrom.FontSize = 15
+    $tbFrom.Margin = '0,0,16,0'
+    $filterPanel.Children.Add($tbFrom) | Out-Null
+
+    $lblTo = New-Object Windows.Controls.Label
+    $lblTo.Content = "To:"
+    $lblTo.FontSize = 16
+    $lblTo.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblTo.Margin = '0,0,6,0'
+    $filterPanel.Children.Add($lblTo) | Out-Null
+
+    $tbTo = New-Object Windows.Controls.TextBox
+    $tbTo.Width = 100
+    $tbTo.FontSize = 15
+    $tbTo.Margin = '0,0,16,0'
+    $filterPanel.Children.Add($tbTo) | Out-Null
+
+    $btnFilter = New-Object Windows.Controls.Button
+    $btnFilter.Content = "Search"
+    $btnFilter.FontSize = 16
+    $btnFilter.Width = 100
+    $btnFilter.Height = 32
+    $btnFilter.Margin = '0,0,6,0'
+    $btnFilter.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnFilter.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnFilter.Add_Click({ & $refreshBlock })
+    $filterPanel.Children.Add($btnFilter) | Out-Null
+
+    $btnReset = New-Object Windows.Controls.Button
+    $btnReset.Content = "Clear"
+    $btnReset.FontSize = 16
+    $btnReset.Width = 100
+    $btnReset.Height = 32
+    $btnReset.Margin = '0,0,6,0'
+    $btnReset.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnReset.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnReset.Add_Click({
+        $cbUser.SelectedIndex = 0
+        $tbFrom.Text = ""
+        $tbTo.Text = ""
+        & $refreshBlock
+    })
+    $filterPanel.Children.Add($btnReset) | Out-Null
+
+    $btnExport = New-Object Windows.Controls.Button
+    $btnExport.Content = "Export CSV"
+    $btnExport.FontSize = 16
+    $btnExport.Width = 100
+    $btnExport.Height = 32
+    $btnExport.Margin = '16,0,6,0'
+    $btnExport.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnExport.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnExport.Add_Click({
+        $cfg = Get-Config
+        Export-History $global:filteredEntries $cfg.ExportPath
+        Show-StylizedMessage "Exported to $($cfg.ExportPath)"
+        if (Test-Path $cfg.ExportPath) {
+            Invoke-Item $cfg.ExportPath
+        }
+    })
+    $filterPanel.Children.Add($btnExport) | Out-Null
+
+    $btnImport = New-Object Windows.Controls.Button
+    $btnImport.Content = "Import CSV"
+    $btnImport.FontSize = 16
+    $btnImport.Width = 100
+    $btnImport.Height = 32
+    $btnImport.Margin = '0,0,6,0'
+    $btnImport.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnImport.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnImport.Add_Click({
+        Add-Type -AssemblyName System.Windows.Forms
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = "CSV files (*.csv)|*.csv"
+        if ($ofd.ShowDialog() -eq "OK") {
+            Import-HoursFromCsv $ofd.FileName
+            & $refreshBlock
+        }
+    })
+    $filterPanel.Children.Add($btnImport) | Out-Null
+
+    $btnTemplate = New-Object Windows.Controls.Button
+    $btnTemplate.Content = "CSV Template"
+    $btnTemplate.FontSize = 16
+    $btnTemplate.Width = 100
+    $btnTemplate.Height = 32
+    $btnTemplate.Margin = '0,0,0,0'
+    $btnTemplate.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnTemplate.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnTemplate.Add_Click({
+        Export-History-Template
+    })
+    $filterPanel.Children.Add($btnTemplate) | Out-Null
+
+    $main.Children.Add($filterPanel)
+    [Windows.Controls.DockPanel]::SetDock($filterPanel, 'Top')
+
+    $lst = New-Object Windows.Controls.ListBox
+    $lst.FontSize = 15
+    $lst.Width = 1500
+    $lst.Height = 700
+    $lst.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString("#eaeaea")))
+    $lst.HorizontalAlignment = 'Center'
+    $lst.VerticalAlignment = 'Top'
+    $lst.Margin = '0,0,0,0'
+
+    $refreshBlock = {
+        $lst.Items.Clear()
+        $global:filteredEntries = @($entries)
+        $selName = $cbUser.Text.Trim()
+        $selFrom = $tbFrom.Text.Trim()
+        $selTo = $tbTo.Text.Trim()
+        if ($selName) { $global:filteredEntries = $global:filteredEntries | Where-Object { $_.UserName -eq $selName } }
+        if ($selFrom) { $global:filteredEntries = $global:filteredEntries | Where-Object { $_.ClockIn -ge "$selFrom 00:00:00" } }
+        if ($selTo) { $global:filteredEntries = $global:filteredEntries | Where-Object { $_.ClockIn -le "$selTo 23:59:59" } }
+        foreach ($e in $global:filteredEntries) {
+            $txt = "{0,-20} {1,5}  {2,19}  {3,19}  {4,8}" -f $e.UserName, $e.UserID, $e.ClockIn, $e.ClockOut, (Format-HoursMinutes $e.HoursWorked)
+            $item = New-Object Windows.Controls.ListBoxItem
+            $item.Content = $txt
+            $item.Tag = $e
+            $lst.Items.Add($item) | Out-Null
+        }
+    }
+    & $refreshBlock
+
+    $lst.Add_MouseRightButtonUp({
+        param($sender, $args)
+        $point = $args.GetPosition($lst)
+        $hit = [System.Windows.Media.VisualTreeHelper]::HitTest($lst, $point)
+        $listItem = $null
+        $dep = $hit.VisualHit
+        while ($dep -and -not ($dep -is [Windows.Controls.ListBoxItem])) {
+            $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep)
+        }
+        if ($dep -is [Windows.Controls.ListBoxItem]) {
+            $lst.SelectedItem = $dep
+            $lst.ContextMenu.IsOpen = $true
+        }
+    })
+
+    $cm = New-Object Windows.Controls.ContextMenu
+    $mEdit = New-Object Windows.Controls.MenuItem
+    $mEdit.Header = "Edit Entry"
+    $mEdit.Add_Click({
+        $item = $lst.SelectedItem
+        if ($item -and $item.Tag) {
+            $entry = $item.Tag
+            Show-EditEntryDialog $entry {
+                $all = @(Get-Entries)
+                $all = $all | Where-Object { -not ($_ -eq $entry) }
+                $all += $entry
+                Set-Entries $all
+                & $refreshBlock
+                Show-StylizedMessage "Entry updated!"
+            }
+        } else {
+            Show-StylizedMessage "Select an entry to edit."
+        }
+    })
+    $cm.Items.Add($mEdit) | Out-Null
+    $lst.ContextMenu = $cm
+
+    $btnEdit = New-Object Windows.Controls.Button
+    $btnEdit.Content = "Edit Entry"
+    $btnEdit.FontSize = 17
+    $btnEdit.Width = 120
+    $btnEdit.Height = 35
+    $btnEdit.Margin = '6,10,0,0'
+    $btnEdit.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btnEdit.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btnEdit.HorizontalAlignment = 'Left'
+    $btnEdit.Add_Click({
+        $item = $lst.SelectedItem
+        if ($item -and $item.Tag) {
+            $entry = $item.Tag
+            Show-EditEntryDialog $entry {
+                $all = @(Get-Entries)
+                $all = $all | Where-Object { -not ($_ -eq $entry) }
+                $all += $entry
+                Set-Entries $all
+                & $refreshBlock
+                Show-StylizedMessage "Entry updated!"
+            }
+        } else {
+            Show-StylizedMessage "Select an entry to edit."
+        }
+    })
+
+    $sidePanel = New-Object Windows.Controls.StackPanel
+    $sidePanel.Orientation = 'Vertical'
+    $sidePanel.Margin = '0,0,0,0'
+    $sidePanel.HorizontalAlignment = 'Left'
+    $sidePanel.Children.Add($btnEdit) | Out-Null
+
+    $main.Children.Add($lst)
+    [Windows.Controls.DockPanel]::SetDock($lst, 'Top')
+
+    $main.Children.Add($sidePanel)
+    [Windows.Controls.DockPanel]::SetDock($sidePanel, 'Bottom')
+
+    $btnBack = New-Object Windows.Controls.Button
+    $btnBack.Content = "Back"
+    $btnBack.FontSize = 20
+    $btnBack.Width = 130
+    $btnBack.Height = 40
+    $btnBack.Margin = '10,16,0,0'
+    $btnBack.HorizontalAlignment = 'Left'
+    $btnBack.Add_Click({ $window.Close(); Show-ManageMenu })
+    $main.Children.Add($btnBack)
+    [Windows.Controls.DockPanel]::SetDock($btnBack, 'Bottom')
+
+    $window.Content = $main
+    $window.ShowDialog() | Out-Null
+}
+
+function Show-ClockScreen {
+    param([string]$Type)
+    $window = New-Object Windows.Window
+    $window.Title = "Clock-$Type"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,70,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = if ($Type -eq 'IN') { "CLOCK IN" } else { "CLOCK OUT" }
+    $lbl.FontSize = 68
+    $lbl.FontFamily = $FontFamily
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = '0,0,0,60'
+    $sp.Children.Add($lbl) | Out-Null
+
+    $lblID = New-Object Windows.Controls.Label
+    $lblID.Content = "Enter Your 4-digit ID:"
+    $lblID.FontSize = 48
+    $lblID.FontFamily = $FontFamily
+    $lblID.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $lblID.HorizontalAlignment = 'Center'
+    $lblID.Margin = '0,0,0,18'
+    $sp.Children.Add($lblID) | Out-Null
+
+    $tbID = New-Object Windows.Controls.TextBox
+    $tbID.FontSize = 54
+    $tbID.Width = 460
+    $tbID.Height = 90
+    $tbID.HorizontalAlignment = 'Center'
+    $tbID.Margin = '0,0,0,50'
+    $sp.Children.Add($tbID) | Out-Null
+
+    $btn = New-Object Windows.Controls.Button
+    $btn.Content = if ($Type -eq 'IN') { "Clock In" } else { "Clock Out" }
+    $btn.FontSize = 54
+    $btn.Width = 680
+    $btn.Height = 160
+    $btn.Margin = '0,0,0,30'
+    $btn.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $btn.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+    $btn.HorizontalAlignment = 'Center'
+    $btn.Add_Click({
+        $id = $tbID.Text.Trim()
+        if (-not ($id -match '^\d{4}$')) { Show-StylizedMessage "ID must be exactly 4 digits."; return }
+        $users = @(Get-Users)
+        $user = $users | Where-Object { $_.ID -eq $id }
+        if (-not $user) { Show-StylizedMessage "User ID not found. Contact Admin."; return }
+        if ($Type -eq 'IN') {
+            $entries = @(Get-Entries)
+            $open = $entries | Where-Object { $_.UserID -eq $id -and -not $_.ClockOut }
+            if ($open) { Show-StylizedMessage "You have already clocked in!"; return }
+            $entry = @{
+                UserName = $user.Name
+                UserID = $user.ID
+                ClockIn = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                ClockOut = $null
+                HoursWorked = $null
+                ClockedByUser = $env:USERNAME
+                ClockedByComputer = $env:COMPUTERNAME
+            }
+            $entries += @($entry)
+            Set-Entries $entries
+            Show-StylizedMessage "Clock-In recorded. Thank you, $($user.Name)!"
+            Write-AuditLog -Event "ClockIN" -User $user.Name
+        } elseif ($Type -eq 'OUT') {
+            $entries = @(Get-Entries)
+            $open = $entries | Where-Object { $_.UserID -eq $id -and -not $_.ClockOut }
+            if (-not $open) { Show-StylizedMessage "No open Clock-In found for you. Please Clock-In first."; Write-AuditLog -Event "ClockOUT Failed" -User $user.Name -Details "No open in"; return }
+            $open.ClockOut = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            $dtIn = [datetime]::ParseExact($open.ClockIn, "yyyy-MM-dd HH:mm:ss", $null)
+            $dtOut = [datetime]::ParseExact($open.ClockOut, "yyyy-MM-dd HH:mm:ss", $null)
+            $open.HoursWorked = "{0:N2}" -f (($dtOut - $dtIn).TotalHours)
+            $open.ClockedByUser = $env:USERNAME
+            $open.ClockedByComputer = $env:COMPUTERNAME
+            $entries = @($entries | Where-Object { $_.UserID -ne $id -or $_.ClockOut })
+            $entries += @($open)
+            Set-Entries $entries
+            $cfg = Get-Config
+            Export-History $entries $cfg.ExportPath
+            Show-StylizedMessage "Clock-Out recorded for $($user.Name)! Total time: $($open.HoursWorked) hrs"
+            Write-AuditLog -Event "ClockOUT" -User $user.Name -Details "Time: $($open.HoursWorked)"
+        }
+        $window.Close()
+        Show-MainMenu
+    })
+    $sp.Children.Add($btn) | Out-Null
+
+    $btnBack = New-Object Windows.Controls.Button
+    $btnBack.Content = "Back"
+    $btnBack.FontSize = 42
+    $btnBack.Width = 400
+    $btnBack.Height = 110
+    $btnBack.Margin = '0,0,0,0'
+    $btnBack.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Gray))
+    $btnBack.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $btnBack.HorizontalAlignment = 'Center'
+    $btnBack.Add_Click({ $window.Close(); Show-MainMenu })
+    $sp.Children.Add($btnBack) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+
+function Show-ManageMenu {
+    $window = New-Object Windows.Window
+    $window.Title = "Manage"
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,80,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = "Manage Menu"
+    $lbl.FontSize = $MainFontSize
+    $lbl.FontFamily = $FontFamily
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = '0,0,0,30'
+    $sp.Children.Add($lbl) | Out-Null
+
+    foreach ($pair in @(
+        @{Name="Add User"; Action={ $window.Close(); Show-AddUser }},
+        @{Name="Del User"; Action={ $window.Close(); Show-DelUser }},
+	@{Name="Change Data Location"; Action={ $window.Close(); Show-ChangeDataLocation }},
+        @{Name="Set Export Location"; Action={ $window.Close(); Show-SetExport }},
+        @{Name="History"; Action={ $window.Close(); Show-History }},
+        @{Name="Back to Main Menu"; Action={ $window.Close(); Show-MainMenu }}
+    )) {
+        $btn = New-Object Windows.Controls.Button
+        $btn.Content = $pair.Name
+        $btn.FontSize = $ButtonFontSize
+        $btn.Width = 320
+        $btn.Height = 70
+        $btn.Margin = '0,0,0,28'
+        $btn.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+        $btn.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+        $btn.HorizontalAlignment = 'Center'
+        $btn.Add_Click($pair.Action)
+        $sp.Children.Add($btn) | Out-Null
+    }
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+function Show-ChangeDataLocation {
+    Add-Type -AssemblyName System.Windows.Forms
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Change Data Location"
+    $form.WindowState = 'Maximized'
+    $form.TopMost = $true
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'None'
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Width = 1000
+    $panel.Height = 300
+    $form.Controls.Add($panel)
+    $panel.Left = [math]::Max(0, ($form.ClientSize.Width - $panel.Width) / 2)
+    $panel.Top  = [math]::Max(0, ($form.ClientSize.Height - $panel.Height) / 2)
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Select or enter a new shared/network folder for data:"
+    $lbl.Font = New-Object System.Drawing.Font($FontFamily, 28)
+    $lbl.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lbl.Left = 20; $lbl.Top = 20; $lbl.Width = 960; $lbl.Height = 56
+    $panel.Controls.Add($lbl)
+
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Font = New-Object System.Drawing.Font($FontFamily, 24)
+    $tb.Left = 40; $tb.Top = 80; $tb.Width = 800; $tb.Height = 50
+    $tb.Text = Get-DataDir
+    $panel.Controls.Add($tb)
+
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = "Browse"
+    $btnBrowse.Font = New-Object System.Drawing.Font($FontFamily, 24)
+    $btnBrowse.Width = 120
+    $btnBrowse.Height = 50
+    $btnBrowse.Left = 860
+    $btnBrowse.Top = 80
+    $btnBrowse.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnBrowse.ForeColor = "Black"
+    $btnBrowse.FlatStyle = "Flat"
+    $btnBrowse.Add_Click({
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fbd.SelectedPath = $tb.Text
+        if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $tb.Text = $fbd.SelectedPath
+        }
+    })
+    $panel.Controls.Add($btnBrowse)
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = "Save"
+    $btnSave.Font = New-Object System.Drawing.Font($FontFamily, 26)
+    $btnSave.Width = 240
+    $btnSave.Height = 60
+    $btnSave.Left = 180
+    $btnSave.Top = 180
+    $btnSave.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnSave.ForeColor = "Black"
+    $btnSave.FlatStyle = "Flat"
+    $btnSave.Add_Click({
+        $newPath = $tb.Text.Trim()
+        if (-not (Test-Path $newPath)) {
+            try { New-Item -ItemType Directory -Path $newPath -Force | Out-Null }
+            catch { Show-StylizedMessage "Could not create/access $newPath."; return }
+        }
+        Set-DataDir $newPath
+        Show-StylizedMessage "Data location changed to:`n$newPath`nRestarting app..."
+        Start-Sleep -Seconds 1
+        Start-Process -FilePath $PSCommandPath
+        exit
+    })
+    $panel.Controls.Add($btnSave)
+
+    $btnBack = New-Object System.Windows.Forms.Button
+    $btnBack.Text = "Back"
+    $btnBack.Font = New-Object System.Drawing.Font($FontFamily, 24)
+    $btnBack.Width = 160
+    $btnBack.Height = 60
+    $btnBack.Left = 480
+    $btnBack.Top = 180
+    $btnBack.BackColor = "Gray"
+    $btnBack.ForeColor = "White"
+    $btnBack.FlatStyle = "Flat"
+    $btnBack.Add_Click({ $form.Close(); Show-ManageMenu })
+    $panel.Controls.Add($btnBack)
+
+    $form.ShowDialog() | Out-Null
+}
+
+function Show-MainMenu {
+    $window = New-Object Windows.Window
+    $window.Title = $AppName
+    $window.WindowStyle = 'None'
+    $window.WindowState = 'Maximized'
+    $window.Topmost = $true
+    $window.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($PrimaryColor)))
+    $window.ResizeMode = 'NoResize'
+    $window.ShowInTaskbar = $true
+
+    $sp = New-Object Windows.Controls.StackPanel
+    $sp.HorizontalAlignment = 'Center'
+    $sp.VerticalAlignment = 'Center'
+    $sp.Margin = '0,50,0,0'
+
+    $lbl = New-Object Windows.Controls.Label
+    $lbl.Content = "DAV Kiosk Time Tracker"
+    $lbl.FontSize = 38
+    $lbl.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+    $lbl.FontFamily = $FontFamily
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = '0,0,0,40'
+    $sp.Children.Add($lbl) | Out-Null
+
+    foreach ($pair in @(
+        @{Name="Clock-In"; Action={ $window.Close(); Show-ClockScreen -Type 'IN' }},
+        @{Name="Clock-Out"; Action={ $window.Close(); Show-ClockScreen -Type 'OUT' }},
+        @{Name="Manage"; Action={ $window.Close(); Show-PasswordPrompt }}
+    )) {
+        $btn = New-Object Windows.Controls.Button
+        $btn.Content = $pair.Name
+        $btn.FontSize = $ButtonFontSize
+        $btn.FontFamily = $FontFamily
+        $btn.Width = 320
+        $btn.Height = 85
+        $btn.Margin = '0,0,0,32'
+        $btn.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($AccentColor)))
+        $btn.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::Black))
+        $btn.HorizontalAlignment = 'Center'
+        $btn.Add_Click($pair.Action)
+        $sp.Children.Add($btn) | Out-Null
+    }
+
+    $btnQuit = New-Object Windows.Controls.Button
+    $btnQuit.Content = "Quit"
+    $btnQuit.FontSize = $ButtonFontSize
+    $btnQuit.FontFamily = $FontFamily
+    $btnQuit.Width = 320
+    $btnQuit.Height = 85
+    $btnQuit.Margin = '0,0,0,16'
+    $btnQuit.Background = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::DarkRed))
+    $btnQuit.Foreground = (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Colors]::White))
+    $btnQuit.HorizontalAlignment = 'Center'
+    $btnQuit.Add_Click({ $window.Close(); exit })
+    $sp.Children.Add($btnQuit) | Out-Null
+
+    $window.Content = $sp
+    $window.ShowDialog() | Out-Null
+}
+
+# ----- PROGRAM START -----
+Show-MainMenu
