@@ -1,0 +1,713 @@
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+
+$AppName = "DAV Office Kiosk"
+$FontFamily = "Arial"
+$PrimaryColor = "#5b5c5a"
+$AccentColor = "#bed12b"
+$MinFontSize = 22
+$DefaultFontSize = 32
+
+$AppDir = "$env:LOCALAPPDATA\DAV_Kiosk"
+$SettingsPath = "$AppDir\settings.json"
+$CsvPath = "$AppDir\signins.csv"
+$DefaultExport = "$env:USERPROFILE\Documents\DAV_SignIns.csv"
+$LogPath = "$AppDir\kiosk.log"
+
+function Write-KioskLog([string]$msg) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $msg"
+    Add-Content -Path $LogPath -Value $line
+}
+
+function Ensure-Config {
+    if (!(Test-Path $AppDir)) { New-Item -ItemType Directory -Path $AppDir -Force | Out-Null }
+    if (!(Test-Path $SettingsPath)) {
+        @{ ExportLocation = $DefaultExport; FontSize = $DefaultFontSize } | ConvertTo-Json | Set-Content $SettingsPath -Encoding UTF8
+    }
+    if (!(Test-Path $CsvPath)) {
+        "First Name,Last Name,Phone Number,Email,Date,Time,Type" | Out-File -FilePath $CsvPath -Encoding UTF8
+    }
+    if (!(Test-Path $LogPath)) {
+        New-Item -Path $LogPath -ItemType File | Out-Null
+    }
+}
+Ensure-Config
+
+function Load-Settings {
+    Ensure-Config
+    try { Get-Content $SettingsPath | ConvertFrom-Json }
+    catch { @{ ExportLocation = $DefaultExport; FontSize = $DefaultFontSize } }
+}
+function Save-Settings($settings) {
+    Ensure-Config
+    $settings | ConvertTo-Json | Set-Content -Path $SettingsPath -Encoding UTF8
+}
+
+function Add-Entry($entry) {
+    Ensure-Config
+    $csvLine = "{0},{1},{2},{3},{4},{5},{6}" -f ($entry.'First Name', $entry.'Last Name', $entry.'Phone Number', $entry.Email, $entry.Date, $entry.Time, $entry.Type)
+    Add-Content -Path $CsvPath -Value $csvLine
+    $settings = Load-Settings
+    if ($settings.ExportLocation -and ($settings.ExportLocation -ne $CsvPath)) {
+        Add-Content -Path $settings.ExportLocation -Value $csvLine
+    }
+    Write-KioskLog "Visitor entry: $($entry.'First Name') $($entry.'Last Name'), $($entry.Type)"
+}
+
+function Validate-Entry($entry) {
+    if (-not $entry.'First Name' -or -not $entry.'Last Name') { return "First and Last Name required." }
+    if ($entry.'Phone Number' -and $entry.'Phone Number' -notmatch '^\d{10}$|^\d{3}[- ]?\d{3}[- ]?\d{4}$') { return "Phone Number must be 10 digits." }
+    if ($entry.Email -and $entry.Email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return "Invalid Email format." }
+    if (-not $entry.Type) { return "Must select Walk-In or Appointment." }
+    return $null
+}
+
+function Show-StylizedMessage($msg, $title = $AppName) {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $title
+    $form.Width = 580
+    $form.Height = 260
+    $form.StartPosition = "CenterScreen"
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MinimizeBox = $false
+    $form.MaximizeBox = $false
+    $form.TopMost = $true
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $msg
+    $lbl.Font = New-Object System.Drawing.Font($FontFamily, 22, [System.Drawing.FontStyle]::Bold)
+    $lbl.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lbl.Size = "480,90"
+    $lbl.Location = "50,40"
+    $lbl.AutoSize = $false
+    $lbl.TextAlign = 'MiddleCenter'
+    $form.Controls.Add($lbl)
+
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = "OK"
+    $btn.Font = New-Object System.Drawing.Font($FontFamily, 22, [System.Drawing.FontStyle]::Bold)
+    $btn.Width = 120
+    $btn.Height = 50
+    $btn.Left = 230
+    $btn.Top = 140
+    $btn.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btn.ForeColor = "Black"
+    $btn.FlatStyle = "Flat"
+    $btn.Add_Click({ $form.Close() })
+    $form.Controls.Add($btn)
+
+    $form.ShowDialog()
+}
+
+function Show-KioskLog {
+    if (Test-Path $LogPath) {
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = "$AppName - Event Log"
+        $form.Width = 950
+        $form.Height = 700
+        $form.StartPosition = "CenterScreen"
+        $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MinimizeBox = $false
+        $form.MaximizeBox = $false
+        $form.TopMost = $true
+
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Multiline = $true
+        $tb.ScrollBars = "Vertical"
+        $tb.Font = New-Object System.Drawing.Font($FontFamily, 14, [System.Drawing.FontStyle]::Regular)
+        $tb.Width = 900
+        $tb.Height = 570
+        $tb.Left = 20
+        $tb.Top = 20
+        $tb.ReadOnly = $true
+        $tb.BackColor = "White"
+        $tb.Text = Get-Content $LogPath -Raw
+        $form.Controls.Add($tb)
+
+	$btn = New-Object System.Windows.Forms.Button
+	$btn.Text = "Back"
+	$btn.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Bold)
+	$btn.Width = 140
+	$btn.Height = 46
+	$btn.Left = 400
+	$btn.Top = 600
+	$btn.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+	$btn.ForeColor = "Black"
+	$btn.FlatStyle = "Flat"
+	$btn.Add_Click({ $form.Close(); Show-AdminMenu })
+	$form.Controls.Add($btn)
+
+        $form.ShowDialog()
+    } else {
+        Show-StylizedMessage "No log file found." "$AppName - Event Log"
+    }
+}
+
+function Show-AdminMenu {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "$AppName - Admin Menu"
+    $form.WindowState = 'Maximized'
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'None'
+    $form.TopMost = $true
+    $form.KeyPreview = $true
+
+    $centerPanel = New-Object System.Windows.Forms.Panel
+    $centerPanel.Width = 800
+    $centerPanel.Height = 800    # Increased height for Quit button
+    $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+    $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    $centerPanel.Anchor = "None"
+    $centerPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.Controls.Add($centerPanel)
+
+    $form.Add_Resize({
+        $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+        $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    })
+
+    $y = 50
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Admin Menu"
+    $lbl.Font = New-Object System.Drawing.Font($FontFamily, 36, [System.Drawing.FontStyle]::Bold)
+    $lbl.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lbl.AutoSize = $true
+    $lbl.Location = "250,$y"
+    $centerPanel.Controls.Add($lbl)
+    $y += 90
+
+    foreach ($pair in @(
+        @{txt="History"; fn={ $form.Close(); Show-History }},
+        @{txt="Export Settings"; fn={ $form.Close(); Show-Settings }},
+        @{txt="Event Log"; fn={ $form.Close(); Show-KioskLog }},
+        @{txt="Return to Sign-In"; fn={ $form.Close(); Show-Kiosk }}
+    )) {
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text = $pair.txt
+        $btn.Font = New-Object System.Drawing.Font($FontFamily, 28, [System.Drawing.FontStyle]::Bold)
+        $btn.Width = 380
+        $btn.Height = 82
+        $btn.Left = [math]::Max(0, ($centerPanel.Width - $btn.Width) / 2)
+        $btn.Top = $y
+        $btn.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+        $btn.ForeColor = "Black"
+        $btn.FlatStyle = "Flat"
+        $btn.Add_Click($pair.fn)
+        $centerPanel.Controls.Add($btn)
+        $y += 102
+    }
+
+    # Add Quit button at bottom
+    $btnQuit = New-Object System.Windows.Forms.Button
+    $btnQuit.Text = "Quit"
+    $btnQuit.Font = New-Object System.Drawing.Font($FontFamily, 26, [System.Drawing.FontStyle]::Bold)
+    $btnQuit.Width = 380
+    $btnQuit.Height = 82
+    $btnQuit.Left = [math]::Max(0, ($centerPanel.Width - $btnQuit.Width) / 2)
+    $btnQuit.Top = $y + 24   # Nice spacing after last menu button
+    $btnQuit.BackColor = "DarkRed"
+    $btnQuit.ForeColor = "White"
+    $btnQuit.FlatStyle = "Flat"
+    $btnQuit.Add_Click({ $form.Close(); [System.Windows.Forms.Application]::Exit() })
+    $centerPanel.Controls.Add($btnQuit)
+
+    $form.ShowDialog()
+}
+
+function Show-Settings {
+    $settings = Load-Settings
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "$AppName - Export Settings"
+    $form.WindowState = 'Maximized'
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'None'
+    $form.TopMost = $true
+    $form.KeyPreview = $true
+
+    $centerPanel = New-Object System.Windows.Forms.Panel
+    $centerPanel.Width = 700
+    $centerPanel.Height = 330
+    $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+    $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    $centerPanel.Anchor = "None"
+    $centerPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.Controls.Add($centerPanel)
+
+    $form.Add_Resize({
+        $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+        $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    })
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Export CSV Location:"
+    $lbl.Font = New-Object System.Drawing.Font($FontFamily, 24, [System.Drawing.FontStyle]::Bold)
+    $lbl.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lbl.AutoSize = $true
+    $lbl.Location = "40,60"
+    $centerPanel.Controls.Add($lbl)
+
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Font = New-Object System.Drawing.Font($FontFamily, 22, [System.Drawing.FontStyle]::Regular)
+    $tb.Width = 430
+    $tb.Location = "40,110"
+    $tb.Text = $settings.ExportLocation
+    $centerPanel.Controls.Add($tb)
+
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = "Browse"
+    $btnBrowse.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Regular)
+    $btnBrowse.Width = 120
+    $btnBrowse.Height = 46
+    $btnBrowse.Left = 490
+    $btnBrowse.Top = 110
+    $btnBrowse.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnBrowse.ForeColor = "Black"
+    $btnBrowse.FlatStyle = "Flat"
+    $btnBrowse.Add_Click({
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Filter = "CSV files (*.csv)|*.csv"
+        $dialog.InitialDirectory = [System.IO.Path]::GetDirectoryName($tb.Text)
+        $dialog.FileName = [System.IO.Path]::GetFileName($tb.Text)
+        if ($dialog.ShowDialog() -eq 'OK') {
+            $tb.Text = $dialog.FileName
+        }
+    })
+    $centerPanel.Controls.Add($btnBrowse)
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = "Save"
+    $btnSave.Font = New-Object System.Drawing.Font($FontFamily, 22, [System.Drawing.FontStyle]::Bold)
+    $btnSave.Width = 120
+    $btnSave.Height = 46
+    $btnSave.Left = 40
+    $btnSave.Top = 190
+    $btnSave.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnSave.ForeColor = "Black"
+    $btnSave.FlatStyle = "Flat"
+    $btnSave.Add_Click({
+        $settings.ExportLocation = $tb.Text
+        Save-Settings $settings
+        Show-StylizedMessage "Settings saved."
+        $form.Close()
+        Show-AdminMenu
+    })
+    $centerPanel.Controls.Add($btnSave)
+
+    $btnBack = New-Object System.Windows.Forms.Button
+    $btnBack.Text = "Back"
+    $btnBack.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Regular)
+    $btnBack.Width = 100
+    $btnBack.Height = 44
+    $btnBack.Left = 180
+    $btnBack.Top = 190
+    $btnBack.BackColor = "Gray"
+    $btnBack.ForeColor = "White"
+    $btnBack.FlatStyle = "Flat"
+    $btnBack.Add_Click({
+        $form.Close()
+        Show-AdminMenu
+    })
+    $centerPanel.Controls.Add($btnBack)
+
+    $form.ShowDialog()
+}
+
+function Show-History {
+    $headers = "First Name","Last Name","Phone Number","Email","Date","Time","Type"
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "$AppName - History"
+    $form.WindowState = 'Maximized'
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'None'
+    $form.TopMost = $true
+    $form.KeyPreview = $true
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Width = 1220
+    $panel.Height = 900
+    $panel.Left = [math]::Max(0, ($form.ClientSize.Width - $panel.Width) / 2)
+    $panel.Top = [math]::Max(0, ($form.ClientSize.Height - $panel.Height) / 2)
+    $panel.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.Controls.Add($panel)
+    $form.Add_Resize({
+        $panel.Left = [math]::Max(0, ($form.ClientSize.Width - $panel.Width) / 2)
+        $panel.Top = [math]::Max(0, ($form.ClientSize.Height - $panel.Height) / 2)
+    })
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Visitor History"
+    $lbl.Font = New-Object System.Drawing.Font($FontFamily, 32, [System.Drawing.FontStyle]::Bold)
+    $lbl.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lbl.AutoSize = $true
+    $lbl.Location = "470,2"
+    $panel.Controls.Add($lbl)
+
+    # Filters
+    $lblFilter = New-Object System.Windows.Forms.Label
+    $lblFilter.Text = "Filter:"
+    $lblFilter.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Bold)
+    $lblFilter.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lblFilter.AutoSize = $true
+    $lblFilter.Location = "70,62"
+    $panel.Controls.Add($lblFilter)
+
+    $tbSearch = New-Object System.Windows.Forms.TextBox
+    $tbSearch.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Regular)
+    $tbSearch.Width = 220
+    $tbSearch.Left = 140
+    $tbSearch.Top = 60
+    $panel.Controls.Add($tbSearch)
+
+    $cbType = New-Object System.Windows.Forms.ComboBox
+    $cbType.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Regular)
+    $cbType.Items.Add("All") | Out-Null
+    $cbType.Items.Add("Walk-In") | Out-Null
+    $cbType.Items.Add("Appointment") | Out-Null
+    $cbType.SelectedIndex = 0
+    $cbType.Left = 370
+    $cbType.Top = 60
+    $cbType.Width = 160
+    $panel.Controls.Add($cbType)
+
+    $btnSearch = New-Object System.Windows.Forms.Button
+    $btnSearch.Text = "Search"
+    $btnSearch.Font = New-Object System.Drawing.Font($FontFamily, 18, [System.Drawing.FontStyle]::Bold)
+    $btnSearch.Width = 110
+    $btnSearch.Height = 40
+    $btnSearch.Left = 540
+    $btnSearch.Top = 60
+    $btnSearch.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnSearch.ForeColor = "Black"
+    $btnSearch.FlatStyle = "Flat"
+    $panel.Controls.Add($btnSearch)
+
+    # Scrollable area for history table
+    $scrollPanel = New-Object System.Windows.Forms.Panel
+    $scrollPanel.Left = 50
+    $scrollPanel.Top = 120
+    $scrollPanel.Width = 1120
+    $scrollPanel.Height = 560
+    $scrollPanel.AutoScroll = $true
+    $scrollPanel.BackColor = "WhiteSmoke"
+    $panel.Controls.Add($scrollPanel)
+
+    # ListView for entries (multi-column, supports selection)
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Parent = $scrollPanel
+    $lv.View = 'Details'
+    $lv.FullRowSelect = $true
+    $lv.Width = $scrollPanel.Width - 16
+    $lv.Height = $scrollPanel.Height - 16
+    $lv.Left = 0
+    $lv.Top = 0
+    $lv.Font = New-Object System.Drawing.Font($FontFamily, 22, [System.Drawing.FontStyle]::Regular)
+    $lv.GridLines = $true
+    $lv.MultiSelect = $false
+    foreach ($h in $headers) { $col = $lv.Columns.Add($h,160) }
+
+    function Load-History([string]$q="", [string]$type="All") {
+        $lv.Items.Clear()
+        if (Test-Path $CsvPath) {
+            $lines = Get-Content $CsvPath | Select-Object -Skip 1
+            foreach ($line in $lines) {
+                $fields = $line -split ",", 7
+                if ($fields.Count -ne 7) { continue }
+                if ($q -and ($fields -join "," -notmatch [Regex]::Escape($q))) { continue }
+                if ($type -ne "All" -and $fields[6] -ne $type) { continue }
+                # THIS IS THE FIX:
+                $item = New-Object System.Windows.Forms.ListViewItem(, $fields)
+                $lv.Items.Add($item) | Out-Null
+            }
+        }
+    }
+    Load-History
+
+    $btnSearch.Add_Click({ Load-History $tbSearch.Text $cbType.Text })
+    $tbSearch.Add_KeyDown({
+        if ($_.KeyCode -eq 'Enter') { Load-History $tbSearch.Text $cbType.Text }
+    })
+    $cbType.Add_SelectedIndexChanged({ Load-History $tbSearch.Text $cbType.Text })
+
+    $btnExport = New-Object System.Windows.Forms.Button
+    $btnExport.Text = "Export CSV"
+    $btnExport.Font = New-Object System.Drawing.Font($FontFamily, 18, [System.Drawing.FontStyle]::Regular)
+    $btnExport.Width = 140
+    $btnExport.Height = 44
+    $btnExport.Left = 900
+    $btnExport.Top = 60
+    $btnExport.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnExport.ForeColor = "Black"
+    $btnExport.FlatStyle = "Flat"
+    $btnExport.Add_Click({
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Filter = "CSV files (*.csv)|*.csv"
+        $dialog.InitialDirectory = $env:USERPROFILE
+        $dialog.FileName = "KioskHistory.csv"
+        if ($dialog.ShowDialog() -eq 'OK') {
+            Copy-Item $CsvPath $dialog.FileName -Force
+            Show-StylizedMessage "Exported to $($dialog.FileName)"
+        }
+    })
+    $panel.Controls.Add($btnExport)
+
+    $btnPrint = New-Object System.Windows.Forms.Button
+    $btnPrint.Text = "Print"
+    $btnPrint.Font = New-Object System.Drawing.Font($FontFamily, 18, [System.Drawing.FontStyle]::Regular)
+    $btnPrint.Width = 120
+    $btnPrint.Height = 44
+    $btnPrint.Left = 1050
+    $btnPrint.Top = 60
+    $btnPrint.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnPrint.ForeColor = "Black"
+    $btnPrint.FlatStyle = "Flat"
+    $btnPrint.Add_Click({
+        $printText = "$($headers -join ',')`n"
+        foreach ($item in $lv.Items) {
+            $row = @()
+            foreach ($i in 0..($headers.Count-1)) { $row += $item.SubItems[$i].Text }
+            $printText += ($row -join ",") + "`n"
+        }
+        Add-Type -AssemblyName System.Drawing
+        $pd = New-Object System.Drawing.Printing.PrintDocument
+        $lines = $printText -split "`n"
+        $pd.add_PrintPage({
+            param($sender, $e)
+            $y = 40
+            $font = New-Object System.Drawing.Font($FontFamily, 12)
+            foreach ($line in $lines) {
+                $e.Graphics.DrawString($line, $font, [System.Drawing.Brushes]::Black, 40, $y)
+                $y += 22
+            }
+        })
+        $pd.Print()
+    })
+    $panel.Controls.Add($btnPrint)
+
+    $btnBack = New-Object System.Windows.Forms.Button
+    $btnBack.Text = "Back"
+    $btnBack.Font = New-Object System.Drawing.Font($FontFamily, 20, [System.Drawing.FontStyle]::Bold)
+    $btnBack.Width = 140
+    $btnBack.Height = 54
+    $btnBack.Left = 50
+    $btnBack.Top = 820
+    $btnBack.BackColor = "Gray"
+    $btnBack.ForeColor = "White"
+    $btnBack.FlatStyle = "Flat"
+    $btnBack.Add_Click({ $form.Close(); Show-AdminMenu })
+    $panel.Controls.Add($btnBack)
+
+    $form.ShowDialog()
+}
+
+# ---- Main Kiosk Sign-in Screen ----
+function Show-Kiosk {
+    $settings = Load-Settings
+    $fontSize = $settings.FontSize
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $AppName
+    $form.WindowState = 'Maximized'
+    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.FormBorderStyle = 'None'
+    $form.TopMost = $true
+    $form.KeyPreview = $true
+
+    $centerPanel = New-Object System.Windows.Forms.Panel
+    $centerPanel.Width = 1100
+    $centerPanel.Height = 900
+    $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+    $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    $centerPanel.Anchor = "None"
+    $centerPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml($PrimaryColor)
+    $form.Controls.Add($centerPanel)
+
+    $form.Add_Resize({
+        $centerPanel.Left = [math]::Max(0, ($form.ClientSize.Width - $centerPanel.Width) / 2)
+        $centerPanel.Top = [math]::Max(0, ($form.ClientSize.Height - $centerPanel.Height) / 2)
+    })
+
+    $y = 36
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = $AppName
+    $lblTitle.Font = New-Object System.Drawing.Font($FontFamily, 44, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $lblTitle.AutoSize = $true
+    $lblTitle.Location = "320,$y"
+    $centerPanel.Controls.Add($lblTitle)
+    $y += 90
+
+    foreach ($pair in @(
+        @{label="First Name:";    var="tbFN";   optional=$false}
+        @{label="Last Name:";     var="tbLN";   optional=$false}
+        @{label="Phone Number:";  var="tbPhone";optional=$true}
+        @{label="Email:";         var="tbEmail";optional=$true}
+    )) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $pair.label
+        $lblFontSize = $fontSize + 8
+        $lbl.Font = New-Object System.Drawing.Font($FontFamily, $lblFontSize, [System.Drawing.FontStyle]::Regular)
+        $lbl.ForeColor = 'White'
+        $lbl.Location = "100,$y"
+        $lbl.Size = "300,60"
+        $lbl.TextAlign = 'MiddleRight'
+        $centerPanel.Controls.Add($lbl)
+
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Name = $pair.var
+        $tbFontSize = $fontSize + 8
+        $tb.Font = New-Object System.Drawing.Font($FontFamily, $tbFontSize, [System.Drawing.FontStyle]::Regular)
+        $tb.Location = "410,$y"
+        $tb.Width = 420
+        $tb.Height = 60
+        $centerPanel.Controls.Add($tb)
+
+        if ($pair.optional) {
+            $lblOpt = New-Object System.Windows.Forms.Label
+            $lblOpt.Text = "Optional"
+            $lblOpt.Font = New-Object System.Drawing.Font($FontFamily, $fontSize + 2, [System.Drawing.FontStyle]::Italic)
+            $lblOpt.ForeColor = $AccentColor
+            $lblOpt.Location = "850,$y"
+            $lblOpt.Size = "180,60"
+            $lblOpt.TextAlign = 'MiddleLeft'
+            $centerPanel.Controls.Add($lblOpt)
+        }
+
+        Set-Variable -Name $pair.var -Value $tb -Scope Local
+        $y += 86
+    }
+
+    $y += 26
+
+    $lblTypeFontSize = $fontSize + 20
+    $lblType = New-Object System.Windows.Forms.Label
+    $lblType.Text = "Visit Type:"
+    $lblType.Font = New-Object System.Drawing.Font($FontFamily, $lblTypeFontSize, [System.Drawing.FontStyle]::Bold)
+    $lblType.ForeColor = $AccentColor
+    $lblType.AutoSize = $true
+    $lblTypeWidth = [System.Windows.Forms.TextRenderer]::MeasureText($lblType.Text, $lblType.Font).Width
+    $lblTypeX = [math]::Max(0, ($centerPanel.Width - $lblTypeWidth) / 2)
+    $lblType.Location = "$lblTypeX,$y"
+    $centerPanel.Controls.Add($lblType)
+    $y += $lblType.Height + 30
+
+    $btnTypeFontSize = $fontSize + 14
+    $btnTypeWalkIn = New-Object System.Windows.Forms.Button
+    $btnTypeWalkIn.Text = "Walk-In"
+    $btnTypeWalkIn.Font = New-Object System.Drawing.Font($FontFamily, $btnTypeFontSize, [System.Drawing.FontStyle]::Bold)
+    $btnTypeWalkIn.Width = 310
+    $btnTypeWalkIn.Height = 100
+    $btnTypeWalkIn.Top = $y
+    $btnTypeWalkIn.BackColor = "WhiteSmoke"
+    $btnTypeWalkIn.FlatStyle = "Flat"
+
+    $btnTypeAppt = New-Object System.Windows.Forms.Button
+    $btnTypeAppt.Text = "Appointment"
+    $btnTypeAppt.Font = New-Object System.Drawing.Font($FontFamily, $btnTypeFontSize, [System.Drawing.FontStyle]::Bold)
+    $btnTypeAppt.Width = 420
+    $btnTypeAppt.Height = 100
+    $btnTypeAppt.Top = $y
+    $btnTypeAppt.BackColor = "WhiteSmoke"
+    $btnTypeAppt.FlatStyle = "Flat"
+
+    $totalBtnWidth = $btnTypeWalkIn.Width + 40 + $btnTypeAppt.Width
+    $startX = [math]::Max(0, ($centerPanel.Width - $totalBtnWidth) / 2)
+    $btnTypeWalkIn.Left = $startX
+    $btnTypeAppt.Left = $startX + $btnTypeWalkIn.Width + 40
+    $centerPanel.Controls.Add($btnTypeWalkIn)
+    $centerPanel.Controls.Add($btnTypeAppt)
+
+    $selectedType = ""
+
+    $setType = {
+        param($which)
+        if ($which -eq "Walk-In") {
+            $btnTypeWalkIn.BackColor = $AccentColor
+            $btnTypeWalkIn.ForeColor = "Black"
+            $btnTypeAppt.BackColor = "WhiteSmoke"
+            $btnTypeAppt.ForeColor = "Black"
+            $script:selectedType = "Walk-In"
+        } elseif ($which -eq "Appointment") {
+            $btnTypeAppt.BackColor = $AccentColor
+            $btnTypeAppt.ForeColor = "Black"
+            $btnTypeWalkIn.BackColor = "WhiteSmoke"
+            $btnTypeWalkIn.ForeColor = "Black"
+            $script:selectedType = "Appointment"
+        }
+    }
+    $btnTypeWalkIn.Add_Click({ & $setType "Walk-In" })
+    $btnTypeAppt.Add_Click({ & $setType "Appointment" })
+    $y += 120
+
+    $btnOSKFontSize = $MinFontSize + 8
+	$btnOSK = New-Object System.Windows.Forms.Button
+	$btnOSK.Text = "Touch Keyboard"
+	$btnOSK.Font = New-Object System.Drawing.Font($FontFamily, $btnOSKFontSize, [System.Drawing.FontStyle]::Bold)
+	$btnOSK.Width = 410
+	$btnOSK.Height = 64
+	$btnOSK.Left = [math]::Max(0, ($centerPanel.Width - $btnOSK.Width) / 2)
+	$btnOSK.Top = $y
+	$btnOSK.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+	$btnOSK.Add_Click({ Start-Process "osk.exe" })
+	$centerPanel.Controls.Add($btnOSK)
+
+    $y += 76
+
+    $btnSubmitFontSize = $fontSize + 14
+    $btnSubmit = New-Object System.Windows.Forms.Button
+    $btnSubmit.Text = "Sign In"
+    $btnSubmit.Font = New-Object System.Drawing.Font($FontFamily, $btnSubmitFontSize, [System.Drawing.FontStyle]::Bold)
+    $btnSubmit.Width = 320
+    $btnSubmit.Height = 86
+    $btnSubmit.Left = [math]::Max(0, ($centerPanel.Width - $btnSubmit.Width) / 2)
+    $btnSubmit.Top = $y
+    $btnSubmit.BackColor = [System.Drawing.ColorTranslator]::FromHtml($AccentColor)
+    $btnSubmit.Add_Click({
+        $entry = @{
+            'First Name'   = $tbFN.Text.Trim()
+            'Last Name'    = $tbLN.Text.Trim()
+            'Phone Number' = $tbPhone.Text.Trim()
+            'Email'        = $tbEmail.Text.Trim()
+            'Date'         = (Get-Date).ToString("yyyy-MM-dd")
+            'Time'         = (Get-Date).ToString("hh:mm tt")
+            'Type'         = $script:selectedType
+        }
+        $err = Validate-Entry $entry
+        if ($err) {
+            Show-StylizedMessage $err
+            Write-KioskLog "Entry failed: $err"
+            return
+        }
+        Add-Entry $entry
+        Show-StylizedMessage "Thank you $($entry.'First Name')! Please have a seat. Your sign-in is complete."
+        $tbFN.Text = ""; $tbLN.Text = ""; $tbPhone.Text = ""; $tbEmail.Text = ""
+        $script:selectedType = ""
+        $btnTypeWalkIn.BackColor = "WhiteSmoke"
+        $btnTypeAppt.BackColor = "WhiteSmoke"
+        $btnTypeWalkIn.ForeColor = "Black"
+        $btnTypeAppt.ForeColor = "Black"
+    })
+    $centerPanel.Controls.Add($btnSubmit)
+    $y += 100
+
+    $btnAdmin = New-Object System.Windows.Forms.Button
+    $btnAdmin.Text = "Admin"
+    $btnAdmin.Font = New-Object System.Drawing.Font($FontFamily, 26, [System.Drawing.FontStyle]::Bold)
+    $btnAdmin.Width = 170
+    $btnAdmin.Height = 62
+    $btnAdmin.Left = $centerPanel.Width - $btnAdmin.Width - 44
+    $btnAdmin.Top = $centerPanel.Height - $btnAdmin.Height - 32
+    $btnAdmin.BackColor = "Gray"
+    $btnAdmin.ForeColor = "White"
+    $btnAdmin.FlatStyle = "Flat"
+    $btnAdmin.Add_Click({
+        $form.Close()
+        Show-AdminMenu
+    })
+    $centerPanel.Controls.Add($btnAdmin)
+
+    $form.ShowDialog()
+}
+
+Show-Kiosk
