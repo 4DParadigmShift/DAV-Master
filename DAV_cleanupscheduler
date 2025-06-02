@@ -133,7 +133,7 @@ function Show-MainForm {
     $btnRemoveFolder = New-Object System.Windows.Forms.Button
     $btnRemoveFolder.Text = "Remove Folder"
     $btnRemoveFolder.Location = '450,92'
-    $btnRemoveFolder.Size = '120,32'
+    $btnRemoveFolder.Size = '150,32'
     $btnRemoveFolder.BackColor = $AccentColor
     $btnRemoveFolder.Add_Click({
         if ($lstFolders.SelectedIndex -ge 0) {
